@@ -123,6 +123,7 @@ public class SpeechToTextPlugin :
     private var bluetoothDisabled = true // final bluetooth state (combines user-defined option and permissions)
     private var resultSent: Boolean = false
     private var lastOnDevice: Boolean = false
+    private var lastSegmented: Boolean = false
     private var speechRecognizer: SpeechRecognizer? = null
     private var recognizerIntent: Intent? = null
     private var bluetoothAdapter: android.bluetooth.BluetoothAdapter? = null
@@ -164,6 +165,16 @@ public class SpeechToTextPlugin :
     }
 
     override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
+        // No Dart caller is left to stop a segmented session, which would keep the microphone open.
+        ++recognizerSession
+        handler.post {
+            run {
+                releaseAudio()
+                speechRecognizer?.cancel()
+                speechRecognizer?.destroy()
+                speechRecognizer = null
+            }
+        }
         this.pluginContext = null;
         channel?.setMethodCallHandler(null)
         channel = null
@@ -658,11 +669,14 @@ public class SpeechToTextPlugin :
 
     private fun createRecognizer(onDevice: Boolean, listenMode: ListenMode, pauseFor: Int?) {
         // A segmented session gets its own recognizer: a late callback of the previous one would
-        // release the audio of this one before the recognizer has taken it.
-        if ( null != speechRecognizer && onDevice == lastOnDevice && !segmented ) {
+        // release the audio of this one before the recognizer has taken it. A session after a
+        // segmented one needs a new recognizer too, the old one may still finish its session.
+        if ( null != speechRecognizer && onDevice == lastOnDevice && !segmented && !lastSegmented ) {
             return
         }
         lastOnDevice = onDevice
+        lastSegmented = segmented
+        releaseAudio()
         speechRecognizer?.destroy()
         speechRecognizer = null
         val listener = SessionListener(++recognizerSession)
@@ -782,9 +796,14 @@ public class SpeechToTextPlugin :
         releaseAudio()
         val channel = AudioFormat.CHANNEL_IN_MONO
         val encoding = AudioFormat.ENCODING_PCM_16BIT
-        val bufferSize = AudioRecord.getMinBufferSize(audioSampleRate, channel, encoding) * 4
-        val record = AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, audioSampleRate,
+        // Unsupported capture falls back to the recognizer's own audio.
+        val minBufferSize = AudioRecord.getMinBufferSize(audioSampleRate, channel, encoding)
+        if (minBufferSize <= 0) return intent
+        val bufferSize = minBufferSize * 4
+        val record = runCatching {
+            AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, audioSampleRate,
                 channel, encoding, bufferSize)
+        }.getOrNull() ?: return intent
         if (record.state != AudioRecord.STATE_INITIALIZED) {
             record.release()
             return intent
