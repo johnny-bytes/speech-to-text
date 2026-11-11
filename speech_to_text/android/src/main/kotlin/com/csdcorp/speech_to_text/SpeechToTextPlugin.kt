@@ -2,6 +2,7 @@ package com.csdcorp.speech_to_text
 
 import android.Manifest
 import android.R.attr.data
+import android.annotation.SuppressLint
 import android.annotation.TargetApi
 import android.app.Activity
 import android.bluetooth.BluetoothAdapter
@@ -13,11 +14,15 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.speech.*
 import android.speech.SpeechRecognizer.createOnDeviceSpeechRecognizer
 import android.speech.SpeechRecognizer.createSpeechRecognizer
@@ -36,6 +41,7 @@ import io.flutter.plugin.common.MethodChannel.Result
 import io.flutter.plugin.common.PluginRegistry
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 import java.util.*
 import java.util.concurrent.Executors
 
@@ -117,6 +123,7 @@ public class SpeechToTextPlugin :
     private var bluetoothDisabled = true // final bluetooth state (combines user-defined option and permissions)
     private var resultSent: Boolean = false
     private var lastOnDevice: Boolean = false
+    private var lastSegmented: Boolean = false
     private var speechRecognizer: SpeechRecognizer? = null
     private var recognizerIntent: Intent? = null
     private var bluetoothAdapter: android.bluetooth.BluetoothAdapter? = null
@@ -128,7 +135,16 @@ public class SpeechToTextPlugin :
     private var previousListenMode: ListenMode = ListenMode.deviceDefault
     private var previousPauseFor: Int? = null
     private var previousContextualPhrases: List<String>? = null
+    private var previousAutoPunctuation: Boolean = false
     private var lastFinalTime: Long = 0
+    private val audioSampleRate = 16000
+    private var audioRecord: AudioRecord? = null
+    private var audioPipe: Array<ParcelFileDescriptor>? = null
+    private var segmented = false
+    private var recognizerSession = 0
+    private val segments = mutableListOf<String>()
+    private var segmentPartial = ""
+    private val segmentConfidences = mutableListOf<Float>()
     private var speechStartTime: Long = 0
     private var minRms: Float = 1000.0F
     private var maxRms: Float = -100.0F
@@ -149,6 +165,16 @@ public class SpeechToTextPlugin :
     }
 
     override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
+        // No Dart caller is left to stop a segmented session, which would keep the microphone open.
+        ++recognizerSession
+        handler.post {
+            run {
+                releaseAudio()
+                speechRecognizer?.cancel()
+                speechRecognizer?.destroy()
+                speechRecognizer = null
+            }
+        }
         this.pluginContext = null;
         channel?.setMethodCallHandler(null)
         channel = null
@@ -221,7 +247,11 @@ public class SpeechToTextPlugin :
                         call.argument<Int?>("pauseFor")
                     val contextualPhrases =
                         call.argument<List<String>>("contextualPhrases")
-                    startListening(result, localeId, partialResults, listenModeIndex, onDevice, pauseFor, contextualPhrases )
+                    var autoPunctuation = call.argument<Boolean>("autoPunctuation")
+                    if ( null == autoPunctuation ) {
+                        autoPunctuation = false
+                    }
+                    startListening(result, localeId, partialResults, listenModeIndex, onDevice, pauseFor, contextualPhrases, autoPunctuation )
                 }
                 "stop" -> stopListening(result)
                 "cancel" -> cancelListening(result)
@@ -309,13 +339,17 @@ public class SpeechToTextPlugin :
 
     private fun startListening(result: Result, languageTag: String, partialResults: Boolean,
                                listenModeIndex: Int, onDevice: Boolean, pauseFor: Int?,
-                               contextualPhrases: List<String>?) {
+                               contextualPhrases: List<String>?, autoPunctuation: Boolean) {
         if (sdkVersionTooLow() || isNotInitialized() || isListening()) {
             result.success(false)
             return
         }
         var listenMode = enumValues<ListenMode>()[listenModeIndex]
 
+        segmented = isSegmented(listenMode)
+        segments.clear()
+        segmentPartial = ""
+        segmentConfidences.clear()
         resultSent = false
         createRecognizer(onDevice, listenMode, pauseFor)
         minRms = 1000.0F
@@ -323,10 +357,11 @@ public class SpeechToTextPlugin :
         debugLog("Start listening")
 
         optionallyStartBluetooth()
-        setupRecognizerIntent(languageTag, partialResults, listenMode, onDevice, pauseFor, contextualPhrases )
+        setupRecognizerIntent(languageTag, partialResults, listenMode, onDevice, pauseFor, contextualPhrases, autoPunctuation )
         handler.post {
             run {
-                speechRecognizer?.startListening(recognizerIntent)
+                val intent = if (segmented) withAudioSource(recognizerIntent) else recognizerIntent
+                speechRecognizer?.startListening(intent)
             }
         }
         speechStartTime = System.currentTimeMillis()
@@ -361,7 +396,8 @@ public class SpeechToTextPlugin :
         debugLog("Stop listening")
         handler.post {
             run {
-                speechRecognizer?.stopListening()
+                // The session ends when its audio ends, after the last segment.
+                if (null != audioRecord) audioRecord?.stop() else speechRecognizer?.stopListening()
             }
         }
         if ( !recognizerStops ) {
@@ -380,6 +416,7 @@ public class SpeechToTextPlugin :
         debugLog("Cancel listening")
         handler.post {
             run {
+                releaseAudio()
                 speechRecognizer?.cancel()
                 speechRecognizer?.destroy()
                 speechRecognizer = null
@@ -466,7 +503,7 @@ public class SpeechToTextPlugin :
         }
     }
     
-    private fun updateResults(speechBundle: Bundle?, isFinal: Boolean) {
+    private fun updateResults(speechBundle: Bundle?, isFinal: Boolean, phrases: List<String>? = null) {
         if (isDuplicateFinal( isFinal )) {
             debugLog("Discarding duplicate final")
             return
@@ -492,6 +529,9 @@ public class SpeechToTextPlugin :
                     speechWords.put("confidence", confidence[resultIndex])
                 } else {
                     speechWords.put("confidence", missingConfidence)
+                }
+                if (null != phrases && resultIndex == 0) {
+                    speechWords.put("recognizedPhrases", JSONArray(phrases))
                 }
                 alternates.put(speechWords)
             }
@@ -628,12 +668,18 @@ public class SpeechToTextPlugin :
     }
 
     private fun createRecognizer(onDevice: Boolean, listenMode: ListenMode, pauseFor: Int?) {
-        if ( null != speechRecognizer && onDevice == lastOnDevice ) {
+        // A segmented session gets its own recognizer: a late callback of the previous one would
+        // release the audio of this one before the recognizer has taken it. A session after a
+        // segmented one needs a new recognizer too, the old one may still finish its session.
+        if ( null != speechRecognizer && onDevice == lastOnDevice && !segmented && !lastSegmented ) {
             return
         }
         lastOnDevice = onDevice
+        lastSegmented = segmented
+        releaseAudio()
         speechRecognizer?.destroy()
         speechRecognizer = null
+        val listener = SessionListener(++recognizerSession)
         handler.post {
             run {
                 debugLog("Creating recognizer")
@@ -643,7 +689,7 @@ public class SpeechToTextPlugin :
                         pluginContext?.findComponentName()
                     ).apply {
                         debugLog("Setting listener after intent lookup")
-                        setRecognitionListener(this@SpeechToTextPlugin)
+                        setRecognitionListener(listener)
                     }
                 } else {
                         var supportsLocal = false
@@ -652,14 +698,14 @@ public class SpeechToTextPlugin :
                         if (supportsLocal ) {
                             speechRecognizer = createOnDeviceSpeechRecognizer(pluginContext!!).apply {
                                 debugLog("Setting on device listener")
-                                setRecognitionListener(this@SpeechToTextPlugin)
+                                setRecognitionListener(listener)
                             }
                         }
                     }
                     if ( null == speechRecognizer) {
                             speechRecognizer = createSpeechRecognizer(pluginContext).apply {
                                 debugLog("Setting default listener")
-                                setRecognitionListener(this@SpeechToTextPlugin)
+                                setRecognitionListener(listener)
                         }
                     }
                 }
@@ -674,22 +720,24 @@ public class SpeechToTextPlugin :
             }
         }
         debugLog("before setup intent")
-        setupRecognizerIntent(defaultLanguageTag, true, listenMode, false, pauseFor, null )
+        setupRecognizerIntent(defaultLanguageTag, true, listenMode, false, pauseFor, null, false )
         debugLog("after setup intent")
     }
 
-    private fun setupRecognizerIntent(languageTag: String, partialResults: Boolean, listenMode: ListenMode, onDevice: Boolean, pauseFor: Int?, contextualPhrases: List<String>? ) {
+    private fun setupRecognizerIntent(languageTag: String, partialResults: Boolean, listenMode: ListenMode, onDevice: Boolean, pauseFor: Int?, contextualPhrases: List<String>?, autoPunctuation: Boolean ) {
         debugLog("setupRecognizerIntent")
         if (previousRecognizerLang == null ||
                 previousRecognizerLang != languageTag ||
                 partialResults != previousPartialResults || previousListenMode != listenMode ||
                 previousPauseFor != pauseFor ||
-                previousContextualPhrases != contextualPhrases ) {
+                previousContextualPhrases != contextualPhrases ||
+                previousAutoPunctuation != autoPunctuation ) {
             previousRecognizerLang = languageTag;
             previousPartialResults = partialResults
             previousListenMode = listenMode
             previousPauseFor = pauseFor
             previousContextualPhrases = contextualPhrases
+            previousAutoPunctuation = autoPunctuation
             handler.post {
                 run {
                     recognizerIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -728,10 +776,73 @@ public class SpeechToTextPlugin :
                         if (Build.VERSION.SDK_INT >= 33 && !contextualPhrases.isNullOrEmpty()) {
                             putExtra(RecognizerIntent.EXTRA_BIASING_STRINGS, contextualPhrases.toTypedArray())
                         }
+                        if (autoPunctuation && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            putExtra(RecognizerIntent.EXTRA_ENABLE_FORMATTING, RecognizerIntent.FORMATTING_OPTIMIZE_QUALITY)
+                        }
                     }
                 }
             }
         }
+    }
+
+    private fun isSegmented(listenMode: ListenMode): Boolean =
+        listenMode == ListenMode.dictation && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+
+    // The app records itself, so the microphone stays open across the recognizer's pauses;
+    // the session then ends only when this audio is closed.
+    @SuppressLint("MissingPermission")
+    private fun withAudioSource(intent: Intent?): Intent? {
+        if (null == intent) return null
+        releaseAudio()
+        val channel = AudioFormat.CHANNEL_IN_MONO
+        val encoding = AudioFormat.ENCODING_PCM_16BIT
+        // Unsupported capture falls back to the recognizer's own audio.
+        val minBufferSize = AudioRecord.getMinBufferSize(audioSampleRate, channel, encoding)
+        if (minBufferSize <= 0) return intent
+        val bufferSize = minBufferSize * 4
+        val record = runCatching {
+            AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, audioSampleRate,
+                channel, encoding, bufferSize)
+        }.getOrNull() ?: return intent
+        if (record.state != AudioRecord.STATE_INITIALIZED) {
+            record.release()
+            return intent
+        }
+        val pipe = ParcelFileDescriptor.createPipe()
+        audioRecord = record
+        audioPipe = pipe
+        record.startRecording()
+        Thread {
+            val buffer = ByteArray(bufferSize)
+            try {
+                ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]).use { out ->
+                    while (true) {
+                        val read = record.read(buffer, 0, buffer.size)
+                        if (read <= 0) break
+                        out.write(buffer, 0, read)
+                    }
+                }
+            } catch (e: IOException) {
+                // releaseAudio closed the pipe
+            }
+        }.start()
+        return Intent(intent).apply {
+            putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, pipe[0])
+            putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
+            putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, encoding)
+            putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, audioSampleRate)
+            putExtra(RecognizerIntent.EXTRA_SEGMENTED_SESSION, RecognizerIntent.EXTRA_AUDIO_SOURCE)
+        }
+    }
+
+    private fun releaseAudio() {
+        audioRecord?.run {
+            if (recordingState == AudioRecord.RECORDSTATE_RECORDING) stop()
+            release()
+        }
+        audioRecord = null
+        audioPipe?.forEach { runCatching { it.close() } }
+        audioPipe = null
     }
 
     private fun destroyRecognizer() {
@@ -760,8 +871,54 @@ public class SpeechToTextPlugin :
     }
 
 
-    override fun onPartialResults(results: Bundle?) = updateResults(results, false)
-    override fun onResults(results: Bundle?) = updateResults(results, true)
+    override fun onPartialResults(results: Bundle?) {
+        if (!segmented) return updateResults(results, false)
+        val words = firstWords(results)
+        if (words.isBlank()) return
+        segmentPartial = words
+        updateSegmentedResults(isFinal = false)
+    }
+
+    override fun onResults(results: Bundle?) {
+        if (segments.isNotEmpty()) return onEndOfSegmentedSession()
+        updateResults(results, true)
+        // A recognizer without segmented sessions ends the session here.
+        if (segmented) {
+            releaseAudio()
+            notifyListening(isRecording = false)
+        }
+    }
+
+    override fun onSegmentResults(segmentResults: Bundle) {
+        val words = firstWords(segmentResults)
+        if (words.isBlank()) return
+        segments += words.trim()
+        segmentPartial = ""
+        segmentResults.getFloatArray(SpeechRecognizer.CONFIDENCE_SCORES)?.firstOrNull()
+            ?.takeIf { it >= 0 }?.let { segmentConfidences += it }
+        updateSegmentedResults(isFinal = false)
+    }
+
+    override fun onEndOfSegmentedSession() {
+        releaseAudio()
+        updateSegmentedResults(isFinal = true)
+        notifyListening(isRecording = false)
+    }
+
+    private fun firstWords(results: Bundle?): String =
+        results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
+
+    // A segment holds only its own words; Dart takes each result as the whole text so far.
+    // Phrases and the lowest confidence follow the format of the iOS phrase aggregation.
+    private fun updateSegmentedResults(isFinal: Boolean) {
+        val phrases = (segments + segmentPartial).filter { it.isNotBlank() }
+        if (phrases.isEmpty()) return
+        updateResults(Bundle().apply {
+            putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf(phrases.joinToString(" ")))
+            segmentConfidences.minOrNull()?.let { putFloatArray(SpeechRecognizer.CONFIDENCE_SCORES, floatArrayOf(it)) }
+        }, isFinal, phrases)
+    }
+
     override fun onBeginningOfSpeech() {
         if (timer != null) {
             timer?.cancel()
@@ -770,6 +927,8 @@ public class SpeechToTextPlugin :
     }
 
     override fun onEndOfSpeech() {
+        // Pauses end only a segment; the session ends with onEndOfSegmentedSession or onResults.
+        if (segmented) return
         (previousPauseFor ?: 1000).also {
             timerTask = object : TimerTask() {
                 override fun run() {
@@ -788,6 +947,7 @@ public class SpeechToTextPlugin :
     }
 
     override fun onError(errorCode: Int) {
+        releaseAudio()
         val delta = System.currentTimeMillis() - speechStartTime
         var errorReturn = errorCode
         if ( SpeechRecognizer.ERROR_NO_MATCH == errorCode && maxRms < speechThresholdRms ) {
@@ -852,6 +1012,30 @@ public class SpeechToTextPlugin :
     override fun onReadyForSpeech(p0: Bundle?) {}
     override fun onBufferReceived(p0: ByteArray?) {}
     override fun onEvent(p0: Int, p1: Bundle?) {}
+
+    // Drops the callbacks of a recognizer that has been replaced.
+    private inner class SessionListener(private val session: Int) : RecognitionListener {
+        private fun current() = session == recognizerSession
+        override fun onReadyForSpeech(params: Bundle?) { if (current()) this@SpeechToTextPlugin.onReadyForSpeech(params) }
+        override fun onBeginningOfSpeech() { if (current()) this@SpeechToTextPlugin.onBeginningOfSpeech() }
+        override fun onRmsChanged(rmsdB: Float) { if (current()) this@SpeechToTextPlugin.onRmsChanged(rmsdB) }
+        override fun onBufferReceived(buffer: ByteArray?) { if (current()) this@SpeechToTextPlugin.onBufferReceived(buffer) }
+        override fun onEndOfSpeech() { if (current()) this@SpeechToTextPlugin.onEndOfSpeech() }
+        override fun onError(error: Int) {
+            if (current()) this@SpeechToTextPlugin.onError(error)
+        }
+        override fun onResults(results: Bundle?) {
+            if (current()) this@SpeechToTextPlugin.onResults(results)
+        }
+        override fun onPartialResults(results: Bundle?) { if (current()) this@SpeechToTextPlugin.onPartialResults(results) }
+        override fun onEvent(eventType: Int, params: Bundle?) { if (current()) this@SpeechToTextPlugin.onEvent(eventType, params) }
+        override fun onSegmentResults(segmentResults: Bundle) {
+            if (current()) this@SpeechToTextPlugin.onSegmentResults(segmentResults)
+        }
+        override fun onEndOfSegmentedSession() {
+            if (current()) this@SpeechToTextPlugin.onEndOfSegmentedSession()
+        }
+    }
 
 }
 
