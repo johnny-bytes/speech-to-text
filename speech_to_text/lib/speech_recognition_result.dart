@@ -55,11 +55,11 @@ class SpeechRecognitionResult {
   /// is if the confidence is missing, which is indicated by a value of
   /// -1. The second is if the confidence is greater than or equal
   /// [threshold]. If [threshold] is not provided it defaults to 0.8.
-  bool isConfident(
-          {double threshold = SpeechRecognitionWords.confidenceThreshold}) =>
-      alternates.isNotEmpty
-          ? alternates.first.isConfident(threshold: threshold)
-          : false;
+  bool isConfident({
+    double threshold = SpeechRecognitionWords.confidenceThreshold,
+  }) => alternates.isNotEmpty
+      ? alternates.first.isConfident(threshold: threshold)
+      : false;
 
   /// true if [confidence] is not the [SpeechRecognitionWords.missingConfidence] value, false
   /// otherwise.
@@ -69,7 +69,7 @@ class SpeechRecognitionResult {
   SpeechRecognitionResult(this.alternates, this.resultType);
 
   SpeechRecognitionResult.init(this.alternates, ResultType resultType)
-      : resultType = resultType.value;
+    : resultType = resultType.value;
 
   @override
   String toString() {
@@ -109,8 +109,11 @@ class SpeechRecognitionWords {
   /// as individual utterances. This can generally be ignored as it
   /// is usually null and where it is not [recognizedWords] will contain
   /// the same information aggregated into a single string.
-  /// Currently this is only populated on iOS 17.5 and 18 where a bug in
-  /// the speech recognizer causes unexpected extra phrases. These are
+  /// Currently this is populated on iOS 17.5 and 18 where a bug in
+  /// the speech recognizer causes unexpected extra phrases, and in
+  /// [ListenMode.dictation] sessions on Android 13+ and iOS/macOS, where
+  /// each phrase is one segment of the session. All phrases but the last
+  /// are complete, the last may still change. These are
   /// automatically handled by the plugin and recognizedWords will be
   /// an aggregate of all the phrases. To customize the handling of
   /// these phrases, use the [SpeechToText.unexpectedPhraseAggregator] property
@@ -128,7 +131,10 @@ class SpeechRecognitionWords {
   static const double missingConfidence = -1;
 
   const SpeechRecognitionWords(
-      this.recognizedWords, this.recognizedPhrases, this.confidence);
+    this.recognizedWords,
+    this.recognizedPhrases,
+    this.confidence,
+  );
 
   /// true if there is confidence in this recognition, false otherwise.
   ///
@@ -167,8 +173,7 @@ class SpeechRecognitionWords {
 enum ResultType {
   partial(0),
   intermediate(1),
-  finalResult(2),
-  ;
+  finalResult(2);
 
   final int value;
 
@@ -177,9 +182,7 @@ enum ResultType {
   static ResultType fromValue(int value) {
     return ResultType.values.firstWhere(
       (e) => e.value == value,
-      orElse: () => throw ArgumentError(
-        'Invalid ResultType value: $value',
-      ),
+      orElse: () => throw ArgumentError('Invalid ResultType value: $value'),
     );
   }
 }

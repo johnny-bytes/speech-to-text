@@ -143,6 +143,7 @@ public class SpeechToTextPlugin :
     private var recognizerSession = 0
     private val segments = mutableListOf<String>()
     private var segmentPartial = ""
+    private val segmentConfidences = mutableListOf<Float>()
     private var speechStartTime: Long = 0
     private var minRms: Float = 1000.0F
     private var maxRms: Float = -100.0F
@@ -337,6 +338,7 @@ public class SpeechToTextPlugin :
         segmented = isSegmented(listenMode)
         segments.clear()
         segmentPartial = ""
+        segmentConfidences.clear()
         resultSent = false
         createRecognizer(onDevice, listenMode, pauseFor)
         minRms = 1000.0F
@@ -490,7 +492,7 @@ public class SpeechToTextPlugin :
         }
     }
     
-    private fun updateResults(speechBundle: Bundle?, isFinal: Boolean) {
+    private fun updateResults(speechBundle: Bundle?, isFinal: Boolean, phrases: List<String>? = null) {
         if (isDuplicateFinal( isFinal )) {
             debugLog("Discarding duplicate final")
             return
@@ -516,6 +518,9 @@ public class SpeechToTextPlugin :
                     speechWords.put("confidence", confidence[resultIndex])
                 } else {
                     speechWords.put("confidence", missingConfidence)
+                }
+                if (null != phrases && resultIndex == 0) {
+                    speechWords.put("recognizedPhrases", JSONArray(phrases))
                 }
                 alternates.put(speechWords)
             }
@@ -870,6 +875,8 @@ public class SpeechToTextPlugin :
         if (words.isBlank()) return
         segments += words.trim()
         segmentPartial = ""
+        segmentResults.getFloatArray(SpeechRecognizer.CONFIDENCE_SCORES)?.firstOrNull()
+            ?.takeIf { it >= 0 }?.let { segmentConfidences += it }
         updateSegmentedResults(isFinal = false)
     }
 
@@ -883,12 +890,14 @@ public class SpeechToTextPlugin :
         results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
 
     // A segment holds only its own words; Dart takes each result as the whole text so far.
+    // Phrases and the lowest confidence follow the format of the iOS phrase aggregation.
     private fun updateSegmentedResults(isFinal: Boolean) {
-        val words = (segments + segmentPartial).filter { it.isNotBlank() }.joinToString(" ")
-        if (words.isBlank()) return
+        val phrases = (segments + segmentPartial).filter { it.isNotBlank() }
+        if (phrases.isEmpty()) return
         updateResults(Bundle().apply {
-            putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf(words))
-        }, isFinal)
+            putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf(phrases.joinToString(" ")))
+            segmentConfidences.minOrNull()?.let { putFloatArray(SpeechRecognizer.CONFIDENCE_SCORES, floatArrayOf(it)) }
+        }, isFinal, phrases)
     }
 
     override fun onBeginningOfSpeech() {

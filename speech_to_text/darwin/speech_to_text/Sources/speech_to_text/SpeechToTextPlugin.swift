@@ -118,6 +118,9 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
   private var onDeviceStatus: Bool = false
   private var listening = false
   private var stopping = false
+  /// Dictation sessions start a new task when the recognizer ends one, so they
+  /// run until stop or cancel instead of ending after about a minute.
+  private var continuous = false
   private var audioEngine: AVAudioEngine?
   private var inputNode: AVAudioInputNode?
   private var aggregateResults: SpeechResultAggregator = SpeechResultAggregator()
@@ -586,6 +589,7 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       failedListen = false
       stopping = false
       returnPartialResults = partialResults
+      continuous = listenMode == ListenMode.dictation
       aggregateResults = SpeechResultAggregator()
       setupRecognizerForLocale(locale: getLocale(localeStr))
       guard let localRecognizer = recognizer else {
@@ -699,7 +703,8 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
         self.inputNode?.installTap(
           onBus: self.busForNodeTap, bufferSize: self.speechBufferSize, format: fmt
         ) { (buffer: AVAudioPCMBuffer, when: AVAudioTime) in
-          currentRequest.append(buffer)
+          // The current request, as a continuous session replaces it.
+          self.currentRequest?.append(buffer)
           self.updateSoundLevel(buffer: buffer)
         }
       }
@@ -739,6 +744,34 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
         os_log("Could not encode JSON", log: pluginLog, type: .error)
       }
     }
+  }
+
+  /// True when the recognizer ended `task` by itself in a continuous session. After
+  /// stop or cancel `currentTask` is no longer `task`.
+  private func continuesAfter(_ task: SFSpeechRecognitionTask) -> Bool {
+    return continuous && !stopping && task === currentTask
+  }
+
+  /// Replaces the ended task with a new one; the audio tap keeps running and feeds
+  /// the new request, and the aggregator keeps the phrases of the ended task.
+  private func startNextTask() {
+    guard let previousRequest = currentRequest, let localRecognizer = recognizer else {
+      stopCurrentListen()
+      return
+    }
+    let request = SFSpeechAudioBufferRecognitionRequest()
+    request.shouldReportPartialResults = previousRequest.shouldReportPartialResults
+    if #available(iOS 13.0, *) {
+      request.requiresOnDeviceRecognition = previousRequest.requiresOnDeviceRecognition
+    }
+    request.contextualStrings = previousRequest.contextualStrings
+    request.taskHint = previousRequest.taskHint
+    if #available(iOS 16.0, macOS 13, *) {
+      request.addsPunctuation = previousRequest.addsPunctuation
+    }
+    aggregateResults = aggregateResults.startingNextTask()
+    currentRequest = request
+    currentTask = localRecognizer.recognitionTask(with: request, delegate: self)
   }
 
   private func updateSoundLevel(buffer: AVAudioPCMBuffer) {
@@ -855,6 +888,7 @@ extension SpeechToTextPlugin: SFSpeechRecognitionTaskDelegate {
   public func speechRecognitionTaskFinishedReadingAudio(_ task: SFSpeechRecognitionTask) {
     reportError(source: "FinishedReadingAudio", error: task.error)
     os_log("Finished reading audio", log: pluginLog, type: .debug)
+    if continuesAfter(task) { return }
     invokeFlutter(
       SwiftSpeechToTextCallbackMethods.notifyStatus,
       arguments: SpeechToTextStatus.notListening.rawValue)
@@ -873,6 +907,11 @@ extension SpeechToTextPlugin: SFSpeechRecognitionTaskDelegate {
   ) {
     reportError(source: "FinishSuccessfully", error: task.error)
     os_log("FinishSuccessfully", log: pluginLog, type: .debug)
+    // 1110: no speech in this task, the session still goes on.
+    if continuesAfter(task) && (successfully || (task.error as NSError?)?.code == 1110) {
+      startNextTask()
+      return
+    }
     if !successfully {
       invokeFlutter(
         SwiftSpeechToTextCallbackMethods.notifyStatus,
@@ -944,7 +983,8 @@ extension SpeechToTextPlugin: SFSpeechRecognitionTaskDelegate {
       if #available(iOS 14.0, macOS 13.0, *) {
           pseudoFinal = recognitionResult.speechRecognitionMetadata != nil
       }
-    let isFinal = recognitionResult.isFinal
+    // A continuous session goes on in the next task, so only its last result is final.
+    let isFinal = recognitionResult.isFinal && !continuesAfter(task)
       handleResult(recognitionResult.transcriptions, isFinal: isFinal, maybeFinal: pseudoFinal )
   }
 
@@ -1007,7 +1047,7 @@ private class SpeechResultAggregator {
     /// current transcription to the previous transcriptions and then return a new aggregator
     /// with that set of transcriptions and the new content.
     public func addResult( _ newResult: [SFTranscription], isFinal: Bool, maybeFinal: Bool ) -> SpeechResultAggregator {
-        if isEmpty {
+        if isEmpty && !hasPreviousTranscriptions {
             return SpeechResultAggregator(withTranscriptions: newResult, final: isFinal, maybeFinal:  interimFinal)
         }
         if !maybeFinal && interimFinal {
@@ -1016,6 +1056,16 @@ private class SpeechResultAggregator {
         return SpeechResultAggregator(withTranscriptions: newResult, existingTranscriptions: previousTranscriptions, final: isFinal, maybeFinal: maybeFinal)
     }
     
+    /// returns a new SpeechResultAggregator for the next task of a continuous session,
+    /// with the current transcriptions kept as previous ones.
+    public func startingNextTask() -> SpeechResultAggregator {
+        var previous = previousTranscriptions
+        if !isEmpty {
+            previous.append(speechTranscriptions)
+        }
+        return SpeechResultAggregator(withTranscriptions: [], existingTranscriptions: previous, final: false, maybeFinal: false)
+    }
+
     public var isEmpty: Bool {
         get {
             speechTranscriptions.isEmpty
